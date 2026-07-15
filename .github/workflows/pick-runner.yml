@@ -26,21 +26,18 @@ on:
         description: also fall back when the runner is online but busy
         type: boolean
         default: false
-      app_id:
-        description: GitHub App id to mint a token from (preferred over a PAT)
-        type: string
-        default: ""
     outputs:
       labels:
         description: runs-on value for downstream jobs
         value: ${{ jobs.pick.outputs.labels }}
     secrets:
-      runner_check_token:
-        # PAT alternative to the App. Optional — without any credential (or on
-        # any API error) we degrade to the fallback runner, never fail the run.
+      # Preferred: a GitHub App with org "Self-hosted runners: Read". Pass both.
+      app_id:
         required: false
       app_private_key:
-        description: Private key for app_id (required only if app_id is set)
+        required: false
+      # Alternative: a PAT with the same read permission.
+      runner_check_token:
         required: false
 
 jobs:
@@ -49,14 +46,14 @@ jobs:
     outputs:
       labels: ${{ steps.pick.outputs.labels }}
     steps:
-      # Mint an org installation token when an App is configured. continue-on-error
-      # keeps a bad/missing key from failing the pipeline — we just fall back.
+      # Mint an org installation token when App creds are provided. Missing/bad
+      # creds just fail this step (continue-on-error) and we fall back — the
+      # pipeline never breaks on a runner-check failure.
       - id: apptoken
-        if: inputs.app_id != ''
         continue-on-error: true
         uses: actions/create-github-app-token@v2
         with:
-          app-id: ${{ inputs.app_id }}
+          app-id: ${{ secrets.app_id }}
           private-key: ${{ secrets.app_private_key }}
           owner: ${{ inputs.org }}
       - id: pick
