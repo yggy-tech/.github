@@ -2,6 +2,14 @@ name: pick-runner
 on:
   workflow_call:
     inputs:
+      scope:
+        description: Where the runner is registered — "org" or "repo"
+        type: string
+        default: repo
+      org:
+        description: Org login for scope=org (defaults to the caller's owner)
+        type: string
+        default: ${{ github.repository_owner }}
       match_label:
         description: Label that identifies your self-hosted runner
         type: string
@@ -37,6 +45,8 @@ jobs:
       - id: pick
         env:
           GH_TOKEN: ${{ secrets.runner_check_token }}
+          SCOPE: ${{ inputs.scope }}
+          ORG: ${{ inputs.org }}
           REPO: ${{ github.repository }}
           MATCH: ${{ inputs.match_label }}
           SELF: ${{ inputs.self_hosted_labels }}
@@ -44,16 +54,21 @@ jobs:
           REQUIRE_IDLE: ${{ inputs.require_idle }}
         run: |
           set -uo pipefail
+          if [ "$SCOPE" = "org" ]; then
+            endpoint="orgs/$ORG/actions/runners"
+          else
+            endpoint="repos/$REPO/actions/runners"
+          fi
           filter='[.runners[] | select(.status=="online")'
           [ "$REQUIRE_IDLE" = "true" ] && filter="$filter | select(.busy==false)"
           filter="$filter | select([.labels[].name] | index(\"$MATCH\"))] | length"
-          # Any failure (no token, API down, rate limit) → 0 → fallback.
-          ready="$(gh api "repos/$REPO/actions/runners" --paginate --jq "$filter" 2>/dev/null || true)"
+          # Any failure (no token, API down, rate limit) -> 0 -> fallback.
+          ready="$(gh api "$endpoint" --paginate --jq "$filter" 2>/dev/null || true)"
           case "$ready" in ''|*[!0-9]*) ready=0 ;; esac
           if [ "$ready" -gt 0 ]; then
             echo "self-hosted runner available -> $SELF"
             echo "labels=$SELF" >> "$GITHUB_OUTPUT"
           else
-            echo "no self-hosted runner -> $FALLBACK"
+            echo "no self-hosted runner ($SCOPE) -> $FALLBACK"
             echo "labels=$FALLBACK" >> "$GITHUB_OUTPUT"
           fi
