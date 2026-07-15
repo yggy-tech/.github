@@ -1,0 +1,53 @@
+name: pick-runner
+on:
+  workflow_call:
+    inputs:
+      match_label:
+        description: Label that identifies your self-hosted runner
+        type: string
+        default: self-hosted
+      self_hosted_labels:
+        description: runs-on value (JSON) when the runner is available
+        type: string
+        default: '["self-hosted"]'
+      fallback_labels:
+        description: runs-on value (JSON) when it isn't
+        type: string
+        default: '"ubuntu-latest"'
+      require_idle:
+        description: also fall back when the runner is online but busy
+        type: boolean
+        default: false
+    outputs:
+      labels:
+        description: runs-on value for downstream jobs
+        value: ${{ jobs.pick.outputs.labels }}
+    secrets:
+      runner_check_token:
+        required: true
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ secrets.runner_check_token }}
+          REPO: ${{ github.repository }}
+          MATCH: ${{ inputs.match_label }}
+          SELF: ${{ inputs.self_hosted_labels }}
+          FALLBACK: ${{ inputs.fallback_labels }}
+          REQUIRE_IDLE: ${{ inputs.require_idle }}
+        run: |
+          set -euo pipefail
+          filter='[.runners[] | select(.status=="online")'
+          [ "$REQUIRE_IDLE" = "true" ] && filter="$filter | select(.busy==false)"
+          filter="$filter | select([.labels[].name] | index(\"$MATCH\"))] | length"
+          ready=$(gh api "repos/$REPO/actions/runners" --paginate --jq "$filter")
+          if [ "$ready" -gt 0 ]; then
+            echo "labels=$SELF" >> "$GITHUB_OUTPUT"
+          else
+            echo "labels=$FALLBACK" >> "$GITHUB_OUTPUT"
+          fi
