@@ -24,7 +24,9 @@ on:
         value: ${{ jobs.pick.outputs.labels }}
     secrets:
       runner_check_token:
-        required: true
+        # Optional: without it (or on any API error) we degrade to the
+        # fallback runner rather than failing the pipeline.
+        required: false
 
 jobs:
   pick:
@@ -41,13 +43,17 @@ jobs:
           FALLBACK: ${{ inputs.fallback_labels }}
           REQUIRE_IDLE: ${{ inputs.require_idle }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           filter='[.runners[] | select(.status=="online")'
           [ "$REQUIRE_IDLE" = "true" ] && filter="$filter | select(.busy==false)"
           filter="$filter | select([.labels[].name] | index(\"$MATCH\"))] | length"
-          ready=$(gh api "repos/$REPO/actions/runners" --paginate --jq "$filter")
+          # Any failure (no token, API down, rate limit) → 0 → fallback.
+          ready="$(gh api "repos/$REPO/actions/runners" --paginate --jq "$filter" 2>/dev/null || true)"
+          case "$ready" in ''|*[!0-9]*) ready=0 ;; esac
           if [ "$ready" -gt 0 ]; then
+            echo "self-hosted runner available -> $SELF"
             echo "labels=$SELF" >> "$GITHUB_OUTPUT"
           else
+            echo "no self-hosted runner -> $FALLBACK"
             echo "labels=$FALLBACK" >> "$GITHUB_OUTPUT"
           fi
