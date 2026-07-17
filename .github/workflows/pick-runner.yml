@@ -76,13 +76,32 @@ jobs:
           filter='[.runners[] | select(.status=="online")'
           [ "$REQUIRE_IDLE" = "true" ] && filter="$filter | select(.busy==false)"
           filter="$filter | select([.labels[].name] | index(\"$MATCH\"))] | length"
-          # Any failure (no credential, bad token, API down) -> 0 -> fallback.
-          ready="$(gh api "$endpoint" --paginate --jq "$filter" 2>/dev/null || true)"
-          case "$ready" in ''|*[!0-9]*) ready=0 ;; esac
+          if [ "$SCOPE" = "org" ]; then
+            perm="the org 'Self-hosted runners: Read' permission"
+          else
+            perm="the repo 'Administration: Read' permission"
+          fi
+          # Query runners, capturing stderr. A failure here (missing credential,
+          # missing permission, bad token, API down) used to be swallowed and
+          # was indistinguishable from "0 runners online". We now surface it as
+          # a warning so the fallback is explainable — the pipeline still never
+          # breaks on a runner check.
+          err="$(mktemp)"
+          raw="$(gh api "$endpoint" --paginate --jq "$filter" 2>"$err")"; rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=pick-runner::runner check failed for $endpoint (gh exit $rc) -> $FALLBACK. Verify the app/token has $perm and can see the runner group."
+            echo "gh api error: $(tr '\n' ' ' < "$err")"
+            ready=0
+          else
+            # --paginate + `length` emits one count per page; sum them
+            # (awk maps empty/non-numeric to 0).
+            ready="$(printf '%s\n' "$raw" | awk '{ s += $1 } END { print s + 0 }')"
+          fi
+          rm -f "$err"
           if [ "$ready" -gt 0 ]; then
-            echo "self-hosted runner available -> $SELF"
+            echo "self-hosted runner available ($ready online, $SCOPE/$MATCH) -> $SELF"
             echo "labels=$SELF" >> "$GITHUB_OUTPUT"
           else
-            echo "no self-hosted runner ($SCOPE/$MATCH) -> $FALLBACK"
+            echo "no online self-hosted runner ($SCOPE/$MATCH) -> $FALLBACK"
             echo "labels=$FALLBACK" >> "$GITHUB_OUTPUT"
           fi
