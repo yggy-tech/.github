@@ -87,7 +87,15 @@ jobs:
           # a warning so the fallback is explainable — the pipeline still never
           # breaks on a runner check.
           err="$(mktemp)"
-          raw="$(gh api "$endpoint" --paginate --jq "$filter" 2>"$err")"; rc=$?
+          # NB: the step runs under `bash -e`, so a plain `raw="$(gh api …)"; rc=$?`
+          # would abort the whole step on the failing assignment BEFORE we could
+          # read rc — defeating the graceful fallback below. Guarding the
+          # assignment with `if` keeps -e from firing and still captures the code.
+          if raw="$(gh api "$endpoint" --paginate --jq "$filter" 2>"$err")"; then
+            rc=0
+          else
+            rc=$?
+          fi
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=pick-runner::runner check failed for $endpoint (gh exit $rc) -> $FALLBACK. Verify the app/token has $perm and can see the runner group."
             echo "gh api error: $(tr '\n' ' ' < "$err")"
