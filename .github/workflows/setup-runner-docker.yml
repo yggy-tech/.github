@@ -1,0 +1,152 @@
+name: setup-runner-docker
+
+# One-time (re-runnable) host setup for a self-hosted runner: gives it a working
+# docker + buildx for the docker/* build actions. OS-aware:
+#
+#   Linux   — native Docker Engine (get.docker.com) + systemd (persists itself)
+#   macOS   — colima (headless Linux VM) + buildx, kept alive by launchd/brew services
+#   Windows — WSL2 + Docker CE inside the distro, exposed to the Windows docker CLI
+#
+# Run from this repo's Actions tab (workflow_dispatch) — set runner_labels so it
+# lands on the runner you want to configure (e.g. ["self-hosted","Linux"]) — or
+# invoke via workflow_call:
+#   jobs:
+#     setup:
+#       uses: drasil-ai/.github/.github/workflows/setup-runner-docker.yml@v1
+#       with:
+#         runner_labels: '["self-hosted","macOS"]'
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'JSON array of labels to target the runner (e.g. ["self-hosted","Linux"])'
+        default: '["self-hosted"]'
+        type: string
+      cpu: { description: "colima VM CPUs (macOS only)", default: "4", type: string }
+      memory: { description: "colima VM memory GiB (macOS only)", default: "8", type: string }
+      disk: { description: "colima VM disk GiB (macOS only)", default: "60", type: string }
+  workflow_call:
+    inputs:
+      runner_labels:
+        description: 'JSON array of labels to target the runner'
+        default: '["self-hosted"]'
+        type: string
+      cpu: { description: "colima VM CPUs (macOS only)", default: "4", type: string }
+      memory: { description: "colima VM memory GiB (macOS only)", default: "8", type: string }
+      disk: { description: "colima VM disk GiB (macOS only)", default: "60", type: string }
+
+jobs:
+  setup:
+    # Target the specific host to configure. Include an OS label so a multi-OS
+    # fleet lands this on the right machine.
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    steps:
+      # ---------------------------------------------------------------- Linux
+      - name: Linux — install Docker Engine + buildx
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Needs passwordless sudo (or a root runner). get.docker.com covers
+          # apt/dnf distros and installs the buildx plugin.
+          if docker version >/dev/null 2>&1; then
+            echo "docker already working"
+          else
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
+          sudo systemctl enable --now docker
+          # Let the runner user talk to docker without sudo.
+          sudo usermod -aG docker "$(id -un)" || true
+          echo "::notice title=setup-runner-docker::Linux docker installed. The 'docker' group change only applies after the runner service restarts."
+
+      # ---------------------------------------------------------------- macOS
+      - name: macOS — install colima + docker CLI + buildx
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"
+          else echo "Homebrew not found on the runner"; exit 1; fi
+
+          brew install colima docker docker-buildx
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sf "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" \
+            "$HOME/.docker/cli-plugins/docker-buildx"
+
+          # Apple Silicon: vz + Rosetta so linux/amd64 builds run at a usable speed.
+          EXTRA=""
+          if [ "$(uname -m)" = "arm64" ]; then EXTRA="--vm-type vz --vz-rosetta"; fi
+          colima start --cpu "${{ inputs.cpu }}" --memory "${{ inputs.memory }}" \
+            --disk "${{ inputs.disk }}" --runtime docker $EXTRA
+          docker version
+          # Hand the VM to launchd so it survives reboots + post-job cleanup.
+          colima stop
+          brew services start colima
+          for _ in $(seq 1 30); do docker version >/dev/null 2>&1 && break; sleep 5; done
+
+      # -------------------------------------------------------------- Windows
+      # ponytail: best-effort, VALIDATE ON A REAL WINDOWS RUNNER. Two ceilings:
+      #  1) If WSL2 isn't already enabled, `wsl --install` enables the feature
+      #     and a REBOOT is required — this run can't finish; re-run after reboot.
+      #  2) The Windows docker CLI reaches dockerd-in-WSL over TCP (2375). We set
+      #     systemd=true in the distro so dockerd persists, download buildx.exe
+      #     for the Windows CLI, and set a machine-level DOCKER_HOST.
+      - name: Windows — WSL2 + Docker CE
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            throw "wsl.exe not found. Enable the WSL feature first (needs a reboot), then re-run this workflow."
+          }
+          # Ensure WSL2 + an Ubuntu distro. If the feature was just enabled this
+          # errors out asking for a reboot — surface that clearly.
+          wsl --set-default-version 2 2>&1 | Write-Host
+          wsl --install --no-launch -d Ubuntu 2>&1 | Write-Host
+          if (-not (wsl -l -q 2>$null | Select-String -SimpleMatch "Ubuntu")) {
+            throw "Ubuntu distro not present yet. WSL2 likely needs a reboot to finish enabling — reboot the runner and re-run."
+          }
+
+          # Enable systemd so dockerd persists, then install Docker CE in the distro.
+          wsl -d Ubuntu -u root -- bash -lc "printf '[boot]\nsystemd=true\n' > /etc/wsl.conf"
+          wsl --shutdown
+          wsl -d Ubuntu -u root -- bash -lc "command -v docker >/dev/null 2>&1 || (curl -fsSL https://get.docker.com | sh)"
+          # Expose dockerd over TCP for the Windows-side CLI.
+          wsl -d Ubuntu -u root -- bash -lc "mkdir -p /etc/docker && printf '{\""hosts\"": [\""unix:///var/run/docker.sock\"", \""tcp://0.0.0.0:2375\""]}' > /etc/docker/daemon.json"
+          wsl -d Ubuntu -u root -- bash -lc "mkdir -p /etc/systemd/system/docker.service.d && printf '[Service]\nExecStart=\nExecStart=/usr/bin/dockerd\n' > /etc/systemd/system/docker.service.d/override.conf"
+          wsl -d Ubuntu -u root -- bash -lc "systemctl daemon-reload && systemctl enable --now docker || (dockerd >/tmp/dockerd.log 2>&1 &)"
+
+          # Windows-side docker CLI -> dockerd-in-WSL over TCP.
+          [Environment]::SetEnvironmentVariable("DOCKER_HOST", "tcp://127.0.0.1:2375", "Machine")
+          if (-not (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
+            choco install docker-cli -y 2>&1 | Write-Host
+          }
+          # buildx plugin for the Windows CLI (choco's docker-cli doesn't bundle it).
+          $plugins = "$env:USERPROFILE\.docker\cli-plugins"
+          New-Item -ItemType Directory -Force -Path $plugins | Out-Null
+          $bx = Invoke-RestMethod "https://api.github.com/repos/docker/buildx/releases/latest"
+          $url = ($bx.assets | Where-Object { $_.name -like "*windows-amd64.exe" } | Select-Object -First 1).browser_download_url
+          Invoke-WebRequest $url -OutFile "$plugins\docker-buildx.exe"
+          Write-Host "::notice title=setup-runner-docker::Windows/WSL2 docker set up (best-effort). Restart the runner service so DOCKER_HOST is picked up."
+
+      # --------------------------------------------------------------- Verify
+      - name: Verify (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
+          fi
+          docker version
+          docker buildx version
+
+      - name: Verify (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:DOCKER_HOST = "tcp://127.0.0.1:2375"
+          docker version
+          docker buildx version
