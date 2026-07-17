@@ -68,6 +68,10 @@ jobs:
           REQUIRE_IDLE: ${{ inputs.require_idle }}
         run: |
           set -uo pipefail
+          # A runner check must never hard-fail the pipeline, so drop errexit:
+          # GitHub runs steps with `bash -e`, and the gh-api probe below is
+          # expected to fail (missing permission, API down) and fall back.
+          set +e
           if [ "$SCOPE" = "org" ]; then
             endpoint="orgs/$ORG/actions/runners"
           else
