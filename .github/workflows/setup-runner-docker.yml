@@ -1,0 +1,82 @@
+name: setup-runner-docker
+
+# One-time (re-runnable) host setup for a self-hosted macOS runner.
+#
+# The docker/* build actions (buildx + GHA cache) need a real docker daemon,
+# which macOS lacks. This installs colima (a headless Linux VM), the docker CLI,
+# and buildx, then hands colima to launchd via `brew services` so it survives
+# reboots and the runner's post-job process cleanup.
+#
+# Run it straight from this repo's Actions tab (workflow_dispatch) to configure
+# the org self-hosted runner, or invoke it from another repo via workflow_call:
+#   jobs:
+#     setup:
+#       uses: drasil-ai/.github/.github/workflows/setup-runner-docker.yml@v1
+on:
+  workflow_dispatch:
+    inputs:
+      cpu: { description: "colima VM CPUs", default: "4", type: string }
+      memory: { description: "colima VM memory (GiB)", default: "8", type: string }
+      disk: { description: "colima VM disk (GiB)", default: "60", type: string }
+  workflow_call:
+    inputs:
+      cpu: { description: "colima VM CPUs", default: "4", type: string }
+      memory: { description: "colima VM memory (GiB)", default: "8", type: string }
+      disk: { description: "colima VM disk (GiB)", default: "60", type: string }
+
+jobs:
+  setup:
+    # Target the self-hosted host directly — this configures that machine.
+    runs-on: [self-hosted]
+    steps:
+      - name: Install colima + docker CLI + buildx
+        run: |
+          set -euo pipefail
+          # The runner may launch with a minimal PATH; source Homebrew's env.
+          if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"
+          else echo "Homebrew not found on the runner"; exit 1; fi
+
+          brew install colima docker docker-buildx
+          # Register buildx as a docker CLI plugin so `docker buildx` resolves.
+          mkdir -p "$HOME/.docker/cli-plugins"
+          ln -sf "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" \
+            "$HOME/.docker/cli-plugins/docker-buildx"
+
+      - name: Start colima and enable autostart at login
+        run: |
+          set -euo pipefail
+          if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
+
+          # Apple Silicon: vz + Rosetta so linux/amd64 builds (the common default
+          # platform) run at a usable speed instead of slow QEMU.
+          EXTRA=""
+          if [ "$(uname -m)" = "arm64" ]; then EXTRA="--vm-type vz --vz-rosetta"; fi
+
+          # First start writes the default VM profile to disk with these specs.
+          colima start \
+            --cpu "${{ inputs.cpu }}" \
+            --memory "${{ inputs.memory }}" \
+            --disk "${{ inputs.disk }}" \
+            --runtime docker \
+            $EXTRA
+          docker version
+
+          # Hand the VM to launchd (reuses the profile just written) so it
+          # persists across reboots and the runner's post-job process cleanup.
+          colima stop
+          brew services start colima
+          for _ in $(seq 1 30); do
+            docker version >/dev/null 2>&1 && break
+            sleep 5
+          done
+
+      - name: Verify docker + buildx
+        run: |
+          set -euo pipefail
+          if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
+          docker version
+          docker buildx version
+          brew services list | grep colima || true
